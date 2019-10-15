@@ -10,8 +10,8 @@ import time
 from queue import Queue
 
 from generate_anchor import generate_anchors_fpn, nonlinear_pred, generate_runtime_anchors
-from numpy import frombuffer, uint8, concatenate, float32, block, maximum, minimum
-from mxnet.ndarray import waitall, array
+from numpy import frombuffer, uint8, concatenate, float32, block, maximum, minimum, prod
+from mxnet.ndarray import waitall, array, concat
 from functools import partial
 
 from threading import Thread
@@ -28,8 +28,8 @@ class BaseDetection:
         self.write_queue = self._queue.put_nowait
         self.read_queue = iter(self._queue.get, b'')
 
-        self._nms_wrapper = partial(
-            self.non_maximum_suppression, threshold=self.nms_threshold)
+        self._nms_wrapper = partial(self.non_maximum_suppression,
+                                    threshold=self.nms_threshold)
 
     def margin_clip(self, b):
         margin_x = (b[2] - b[0]) * self.margin
@@ -113,25 +113,53 @@ class MxnetDetectionModel(BaseDetection):
     def __init__(self, prefix, epoch, scale, gpu=-1, thd=0.6, margin=0,
                  nms_thd=0.4, verbose=False):
 
-        super().__init__(thd=thd, gpu=gpu, margin=margin, nms_thd=nms_thd, verbose=verbose)
+        super().__init__(thd=thd, gpu=gpu, margin=margin,
+                         nms_thd=nms_thd, verbose=verbose)
 
         self.scale = scale
         self._rescale = partial(cv2.resize, dsize=None, fx=self.scale,
-                                fy=self.scale, interpolation=cv2.INTER_LINEAR)
+                                fy=self.scale, interpolation=cv2.INTER_NEAREST)
 
         self._ctx = mx.cpu() if self.device < 0 else mx.gpu(self.device)
-        self._fpn_anchors = generate_anchors_fpn().items()
+        self._fpn_anchors = generate_anchors_fpn()
         self._runtime_anchors = {}
 
         model = self._load_model(prefix, epoch)
-
         self._forward = partial(model.forward, is_train=False)
-        self._solotion = model.get_outputs
+
+        # ========== Monkey Patch for Mxnet Inference ==========
+        def faster_outputs(execs, begin=0, end=None):
+            for exec_ in execs:
+
+                out = iter(exec_.outputs)
+
+                res, shapes = [], []
+
+                for fpn in self._fpn_anchors:
+                    scores = next(out)[:, -fpn.scales_shape:, :,
+                                       :].transpose((0, 2, 3, 1)).reshape((-1, 1))
+                    deltas = next(out).transpose((0, 2, 3, 1))
+
+                    res.append(scores.reshape(-1))
+                    shapes.append(scores.shape)
+
+                    res.append(deltas.reshape(-1))
+                    shapes.append(deltas.shape)
+
+                buffer = concat(*res, dim=0).asnumpy()
+
+                for shape in shapes:
+                    size = prod(shape)
+                    yield buffer[:size].reshape(shape)
+                    buffer = buffer[size:]
+
+        self._solotion = partial(faster_outputs,
+                                 execs=model._exec_group.execs)
 
     def _load_model(self, prefix, epoch):
         sym, arg_params, aux_params = mx.model.load_checkpoint(prefix, epoch)
         model = mx.mod.Module(sym, context=self._ctx, label_names=None)
-        model.bind(data_shapes=[('data', (1, 3, 640, 480))],
+        model.bind(data_shapes=[('data', (1, 3, 480, 640))],
                    for_training=False)
         model.set_params(arg_params, aux_params)
         return model
@@ -170,20 +198,22 @@ class MxnetDetectionModel(BaseDetection):
         '''
 
         for fpn in self._fpn_anchors:
-            scores, deltas = next(out)[:, fpn[1].shape[0]:, ...], next(out)
+            scores, deltas = next(out), next(out)
 
-            scores = scores.transpose((0, 2, 3, 1)).reshape((-1, 1))
             mask = scores.ravel() > self.threshold
 
-            anchors = self._get_runtime_anchors(*deltas.shape[-2:], *fpn)[mask]
-            deltas = deltas.transpose((0, 2, 3, 1)).reshape((-1, 4))[mask]
+            anchors = self._get_runtime_anchors(*deltas.shape[1:3],
+                                                fpn.stride,
+                                                fpn.base_anchors)[mask]
+
+            deltas = deltas.reshape((-1, 4))[mask]
 
             nonlinear_pred(anchors, deltas)
 
             yield [deltas / self.scale, scores[mask]]
 
     def _retina_detach(self, out):
-        out = map(lambda x: x.asnumpy(), out)
+        # out = map(lambda x: x.asnumpy(), out)
         return block(list(self._retina_solving(out)))
 
     def _retina_forward(self, src):
@@ -211,13 +241,13 @@ class MxnetDetectionModel(BaseDetection):
 
         dst = self._rescale(src)
 
-        timea = time.perf_counter()
+        # timea = time.perf_counter()
         data = array(dst.transpose((2, 0, 1))[None, ...])
-        print(f'inferance: {time.perf_counter() - timea}')
+        # print(f'inferance: {time.perf_counter() - timea}')
 
         db = mx.io.DataBatch(data=(data, ))
-
         self._forward(db)
+
         return self._solotion()
 
     def workflow_inference(self, instream, shape):
@@ -225,6 +255,7 @@ class MxnetDetectionModel(BaseDetection):
             # st = time.perf_counter()
 
             frame = frombuffer(source, dtype=uint8).reshape(shape)
+
             out = self._retina_forward(frame)
 
             try:
@@ -237,10 +268,10 @@ class MxnetDetectionModel(BaseDetection):
 
     def workflow_postprocess(self, outstream=None):
         for frame, out in self.read_queue:
-            # st = time.perf_counter()
+            st = time.perf_counter()
             detach = self._retina_detach(out)
             # dets = self.non_maximum_selection(detach)  # 1.7 us
-            # print(f'_retina_detach: {time.perf_counter() - st}')
+            print(f'_retina_detach: {time.perf_counter() - st}')
 
             if outstream is None:
                 for res in self._nms_wrapper(detach):
@@ -248,11 +279,11 @@ class MxnetDetectionModel(BaseDetection):
                     cv2.rectangle(frame, (res[0], res[1]),
                                   (res[2], res[3]), (255, 255, 0))
 
-                cv2.imshow('res', frame)
-                cv2.waitKey(1)
+                # cv2.imshow('res', frame)
+                # cv2.waitKey(1)
             else:
                 outstream(frame)
-                outstream(res)
+                outstream(detach)
 
 
 if __name__ == '__main__':
